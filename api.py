@@ -32,7 +32,7 @@ def scrape(data: ScrapeRequest):
         f"--url={data.url}",
         f"--sort={data.sort}",
         "--output=json",
-        # "--headless"
+        "--headless"
     ]
     # cmd = [
     #     "xvfb-run",
