@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Environment
+.env
+
+# Logs
+*.log
+app.log
+
+# Browser Profile (Playwright)
+browser-profile/
+playwright-profile/
+user-data/
+chrome-data/
+
+# Playwright
+playwright-report/
+test-results/
+
+# Screenshots
+headless-debug.png
+*.png
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache
+.pytest_cache/
+.mypy_cache/
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Node (if any)
+node_modules/
