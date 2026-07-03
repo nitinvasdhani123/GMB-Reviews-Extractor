@@ -636,23 +636,72 @@ class MapsScraper:
     # ── 6. Scroll ─────────────────────────────────────────────────────────────
 
     async def scroll_all(self, expected_reviews: int) -> int:
-        log.info("Scrolling to load all reviews")
-        container    = await self._find(SEL_SCROLL_CONT, timeout=5000)
-        last_count   = 0
+        log.info("Starting robust scroll logic. Expected reviews: %d", expected_reviews)
+        last_count = 0
         stall_streak = 0
+        scroll_attempt = 0
 
         start_time = time.time()
 
         while True:
-            if time.time() - start_time > 120:
-                log.info("Maximum scroll time reached")
+            scroll_attempt += 1
+
+            # Check maximum scroll time limit
+            elapsed = time.time() - start_time
+            if elapsed > 120:
+                log.info(
+                    "Scrolling stopped: Maximum scroll time of 120s exceeded (Elapsed: %.1fs). Final review count: %d, Expected: %d",
+                    elapsed, len(self.review_cache), expected_reviews
+                )
                 break
 
             await self._expand_more()
 
-            # Batch locate all review cards
-            cards = await self._page.locator("div[data-review-id]").all()
+            # Dynamic container-based scroll evaluation
+            try:
+                scroll_script = """
+                () => {
+                    const card = document.querySelector('div[data-review-id]');
+                    if (card) {
+                        let parent = card.parentElement;
+                        while (parent) {
+                            const style = window.getComputedStyle(parent);
+                            if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                parent.scrollTo(0, parent.scrollHeight);
+                                parent.scrollTop = parent.scrollHeight;
+                                return "scrolled_parent_container";
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                    for (const sel of ["div.m6QErb[tabindex]", "div[role='feed']", "div.DxyBCb"]) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            el.scrollTo(0, el.scrollHeight);
+                            el.scrollTop = el.scrollHeight;
+                            return "scrolled_fallback_selector";
+                        }
+                    }
+                    window.scrollTo(0, document.body.scrollHeight);
+                    return "scrolled_window";
+                }
+                """
+                scroll_type = await self._page.evaluate(scroll_script)
+                log.debug("Scroll attempt %d type: %s", scroll_attempt, scroll_type)
+            except Exception as e:
+                log.warning("Scroll attempt %d failed: %s", scroll_attempt, e)
 
+            # Wait for content to load
+            await asyncio.sleep(2.0)
+
+            # Batch locate all review cards
+            try:
+                cards = await self._page.locator("div[data-review-id]").all()
+            except Exception as e:
+                log.warning("Failed to locate review cards in DOM: %s", e)
+                cards = []
+
+            newly_added = 0
             for card in cards:
                 try:
                     review_id = await card.get_attribute("data-review-id", timeout=500)
@@ -665,41 +714,38 @@ class MapsScraper:
                 review = await self._parse_card(card)
                 if review:
                     self.review_cache[review["review_id"]] = review
+                    newly_added += 1
 
             count = len(self.review_cache)
+            new_reviews_loaded = count > last_count
+
+            # Detailed logs showing all progress details
             log.info(
-                "Loaded %d / %d reviews",
-                count,
-                expected_reviews
+                "Scroll attempt: %d | Loaded reviews (current): %d | Loaded reviews (previous): %d | New reviews loaded in this scroll: %s (%d new) | Expected reviews: %d",
+                scroll_attempt, count, last_count, "Yes" if new_reviews_loaded else "No", newly_added, expected_reviews
             )
-            if count > last_count:
+
+            if new_reviews_loaded:
                 stall_streak = 0
             else:
                 stall_streak += 1
+                log.info("Stall streak: %d/5 (retrying scroll...)", stall_streak)
 
             if expected_reviews > 0 and count >= expected_reviews:
-                log.info("Loaded all %d reviews", count)
+                log.info(
+                    "Scrolling stopped: Reached or exceeded expected review count (Current: %d, Expected: %d). Final review count: %d",
+                    count, expected_reviews, count
+                )
                 break
 
             if stall_streak >= 5:
-                log.info("No more reviews after multiple scrolls")
+                log.info(
+                    "Scrolling stopped: No new reviews loaded after %d consecutive scroll attempts. Final review count: %d, Expected: %d",
+                    stall_streak, count, expected_reviews
+                )
                 break
 
             last_count = count
-            cards_loc = self._page.locator("div[data-review-id]")
-
-            try:
-                card_count = await cards_loc.count()
-                if card_count > 0:
-                    await cards_loc.nth(card_count - 1).scroll_into_view_if_needed()
-                elif container:
-                    await container.evaluate("el => el.scrollBy(0, 1000)")
-                else:
-                    await self._page.evaluate("window.scrollBy(0, 1000)")
-            except Exception:
-                await self._page.evaluate("window.scrollBy(0, 1000)")
-
-            await asyncio.sleep(1.5)
 
         return last_count
 
