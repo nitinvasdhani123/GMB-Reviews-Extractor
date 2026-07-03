@@ -27,16 +27,21 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-# ── logging to stderr only (stdout is reserved for JSON output) ─────────────
+# ── logging to stderr and app.log (stdout is reserved for JSON output) ─────────────
+
+log_handlers = [
+    logging.StreamHandler(sys.stderr),
+    logging.FileHandler(os.path.join(os.path.dirname(__file__), "app.log"), encoding="utf-8")
+]
 
 logging.basicConfig(
-    stream=sys.stderr,
     level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(message)s",
     datefmt="%H:%M:%S",
+    handlers=log_handlers
 )
 log = logging.getLogger("scraper")
 
@@ -120,7 +125,7 @@ def _relative_to_iso(text: str) -> Optional[str]:
     if not text:
         return None
     text = text.lower().strip()
-    now  = datetime.utcnow()
+    now  = datetime.now(timezone.utc)
     m = re.search(r"(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago", text)
     if m:
         n, unit = int(m.group(1)), m.group(2)
@@ -145,13 +150,15 @@ async def _delay(lo: float = 0.5, hi: float = 1.4) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class MapsScraper:
-    def __init__(self, url: str, sort_by: str, profile_dir: str, headless: bool):
+    def __init__(self, url: str, sort_by: str, profile_dir: str, headless: bool, max_reviews: int = 50):
         self.url         = url
         self.sort_by     = sort_by
         self.profile_dir = profile_dir
         self.headless    = headless
+        self.max_reviews = max_reviews
 
         self._pw   = None
+        self._browser = None
         self._ctx  = None
         self._page = None
 
@@ -225,11 +232,13 @@ class MapsScraper:
                 "--lang=en-US",
             ],
         )
+        self._browser = browser
 
         self._ctx = await browser.new_context(
             viewport={"width": 1380, "height": 900},
             locale="en-US",
             timezone_id="UTC",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9"
             },
@@ -247,15 +256,27 @@ class MapsScraper:
 
     async def __aexit__(self, *_):
         try:
-            if self._ctx:  await self._ctx.close()
-            if self._pw:   await self._pw.stop()
-        except Exception:
-            pass
+            if self._ctx:     await self._ctx.close()
+            if self._browser: await self._browser.close()
+            if self._pw:      await self._pw.stop()
+        except Exception as e:
+            log.debug("Error during exit cleanup: %s", e)
 
     # ── selector helpers ──────────────────────────────────────────────────────
 
-    async def _find(self, selectors: List[str], parent=None, timeout: int = 8000):
+    async def _find(self, selectors: List[str], parent=None, timeout: int = 2000):
         root = parent or self._page
+        # Fast check: see if any selector already has elements
+        for sel in selectors:
+            try:
+                loc = (root.locator(f"xpath={sel}") if sel.startswith("//")
+                       else root.locator(sel)).first
+                if await loc.count() > 0:
+                    return loc
+            except Exception:
+                pass
+
+        # Fallback check: wait for attachment with timeout
         for sel in selectors:
             try:
                 loc = (root.locator(f"xpath={sel}") if sel.startswith("//")
@@ -327,29 +348,40 @@ class MapsScraper:
     async def _handle_consent(self) -> None:
         try:
             buttons = await self._page.locator("button").all()
-
             for btn in buttons:
                 try:
                     text = (await btn.inner_text()).strip()
-
-                    if any(x in text.lower() for x in [
-                        "accept",
-                        "agree",
-                        "priimti",
-                        "accepter",
-                        "akzeptieren"
-                    ]):
+                    if any(x in text.lower() for x in ["accept", "agree", "priimti", "accepter", "akzeptieren", "read more"]):
                         await btn.click()
-                        log.info("Consent accepted: %s", text)
+                        log.info("Consent accepted on main page: %s", text)
                         await _delay(2, 3)
                         return
-                except:
+                except Exception:
                     pass
 
+            for frame in self._page.frames:
+                try:
+                    buttons = await frame.locator("button").all()
+                    for btn in buttons:
+                        try:
+                            text = (await btn.inner_text()).strip()
+                            if any(x in text.lower() for x in ["accept", "agree", "priimti", "accepter", "akzeptieren"]):
+                                await btn.click()
+                                log.info("Consent accepted in frame: %s", text)
+                                await _delay(2, 3)
+                                return
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
         except Exception as e:
             log.warning("Consent handling failed: %s", e)
 
     async def _wait_captcha(self) -> bool:
+        if self.headless:
+            log.error("CAPTCHA detected in headless mode. Manual solve is impossible. Failing immediately.")
+            return False
+
         log.warning("CAPTCHA detected — waiting for manual solve (max %ds)", CAPTCHA_MAX_WAIT)
         deadline = time.time() + CAPTCHA_MAX_WAIT
         while time.time() < deadline:
@@ -464,7 +496,17 @@ class MapsScraper:
             try:
                 loc = (self._page.locator(f"xpath={sel}") if sel.startswith("//")
                        else self._page.locator(sel)).first
-                await loc.wait_for(state="visible", timeout=4000)
+                if await loc.is_visible():
+                    return True
+            except Exception:
+                pass
+
+        if SEL_BIZ_NAME:
+            try:
+                sel = SEL_BIZ_NAME[0]
+                loc = (self._page.locator(f"xpath={sel}") if sel.startswith("//")
+                       else self._page.locator(sel)).first
+                await loc.wait_for(state="visible", timeout=3000)
                 return True
             except Exception:
                 pass
@@ -533,12 +575,18 @@ class MapsScraper:
     async def open_reviews_tab(self) -> bool:
         log.info("Opening Reviews tab")
 
-        tabs = await self._page.locator("[role='tab']").all()
+        # Skip clicking tab if reviews are already loaded and visible
+        try:
+            if await self._page.locator("div[data-review-id]").count() > 0:
+                log.info("Reviews already visible, skipping tab click")
+                return True
+        except Exception:
+            pass
 
+        tabs = await self._page.locator("[role='tab']").all()
         for tab in tabs:
             try:
                 text = (await tab.inner_text()).strip().lower()
-
                 if any(x in text for x in [
                     "review",
                     "atsiliep",
@@ -549,10 +597,8 @@ class MapsScraper:
                 ]):
                     await tab.click()
                     await _delay(2, 3)
-
                     log.info("Reviews tab clicked: %s", text)
                     return True
-
             except Exception:
                 pass
 
@@ -589,7 +635,6 @@ class MapsScraper:
 
     # ── 6. Scroll ─────────────────────────────────────────────────────────────
 
-    # async def scroll_all(self) -> int:
     async def scroll_all(self, expected_reviews: int) -> int:
         log.info("Scrolling to load all reviews")
         container    = await self._find(SEL_SCROLL_CONT, timeout=5000)
@@ -605,19 +650,19 @@ class MapsScraper:
 
             await self._expand_more()
 
-            # count = await self._count_cards()
-            # cards = await self._page.locator("div[data-review-id]").all()
+            # Batch locate all review cards
+            cards = await self._page.locator("div[data-review-id]").all()
 
-            # for card in cards:
-            #     review = await self._parse_card(card)
-            #     if review:
-            #         self.review_cache[review["review_id"]] = review
+            for card in cards:
+                try:
+                    review_id = await card.get_attribute("data-review-id", timeout=500)
+                except Exception:
+                    review_id = None
 
-            locator = self._page.locator("div[data-review-id]")
-            count_cards = await locator.count()
+                if review_id and review_id in self.review_cache:
+                    continue
 
-            for i in range(count_cards):
-                review = await self._parse_card(locator.nth(i))
+                review = await self._parse_card(card)
                 if review:
                     self.review_cache[review["review_id"]] = review
 
@@ -629,14 +674,9 @@ class MapsScraper:
             )
             if count > last_count:
                 stall_streak = 0
-                # log.info("  %d reviews loaded", count)
             else:
                 stall_streak += 1
-                # log.debug("  stall %d/6", stall_streak)
 
-            # if stall_streak >= 6:
-            #     log.info("All reviews loaded: %d cards", count)
-            #     break
             if expected_reviews > 0 and count >= expected_reviews:
                 log.info("Loaded all %d reviews", count)
                 break
@@ -646,33 +686,19 @@ class MapsScraper:
                 break
 
             last_count = count
-            # delta = random.randint(700, 1100)
-            # try:
-            #     if container:
-            #         await container.evaluate(f"el => el.scrollBy(0, {delta})")
-            #     else:
-            #         await self._page.evaluate(f"window.scrollBy(0, {delta})")
-            # except Exception:
-            #     await self._page.evaluate(f"window.scrollBy(0, {delta})")
-
-            # await asyncio.sleep(random.uniform(1.2, 2.4))
-            cards = self._page.locator("div[data-review-id]")
+            cards_loc = self._page.locator("div[data-review-id]")
 
             try:
-                if await cards.count() > 0:
-                    # Last loaded review tak scroll karo
-                    # await cards.last.scroll_into_view_if_needed()
-                    await cards.nth(await cards.count() - 1).scroll_into_view_if_needed()
+                card_count = await cards_loc.count()
+                if card_count > 0:
+                    await cards_loc.nth(card_count - 1).scroll_into_view_if_needed()
                 elif container:
-                    # Fallback
                     await container.evaluate("el => el.scrollBy(0, 1000)")
                 else:
                     await self._page.evaluate("window.scrollBy(0, 1000)")
             except Exception:
                 await self._page.evaluate("window.scrollBy(0, 1000)")
 
-            # Google ko next reviews load karne ka time do
-            # await asyncio.sleep(random.uniform(2.5, 4.0))
             await asyncio.sleep(1.5)
 
         return last_count
@@ -744,17 +770,23 @@ class MapsScraper:
         try:
             review_id = ""
             try:
-                review_id = await card.get_attribute("data-review-id") or ""
+                review_id = await card.get_attribute("data-review-id", timeout=1000) or ""
             except Exception:
                 pass
+
+            # Quick cache check
+            if review_id and review_id in self.review_cache:
+                return self.review_cache[review_id]
 
             # Reviewer name
             name = ""
             for sel in ["div.d4r55", "button.WEBjve", "span.TSUbDb"]:
                 try:
-                    name = (await card.locator(sel).first.inner_text(timeout=1500)).strip()
-                    if name:
-                        break
+                    loc = card.locator(sel).first
+                    if await loc.count() > 0:
+                        name = (await loc.inner_text(timeout=1000)).strip()
+                        if name:
+                            break
                 except Exception:
                     pass
 
@@ -762,10 +794,12 @@ class MapsScraper:
             profile_url = ""
             for sel in ["a.WEBjve", "button.WEBjve"]:
                 try:
-                    href = await card.locator(sel).first.get_attribute("href", timeout=1500)
-                    if href:
-                        profile_url = href
-                        break
+                    loc = card.locator(sel).first
+                    if await loc.count() > 0:
+                        href = await loc.get_attribute("href", timeout=1000)
+                        if href:
+                            profile_url = href
+                            break
                 except Exception:
                     pass
 
@@ -773,11 +807,13 @@ class MapsScraper:
             rating = None
             for sel in ["span[aria-label*='star']", "span[role='img'][aria-label*='star']"]:
                 try:
-                    aria = await card.locator(sel).first.get_attribute("aria-label", timeout=1500) or ""
-                    r    = _parse_rating(aria)
-                    if r is not None:
-                        rating = int(round(r))
-                        break
+                    loc = card.locator(sel).first
+                    if await loc.count() > 0:
+                        aria = await loc.get_attribute("aria-label", timeout=1000) or ""
+                        r    = _parse_rating(aria)
+                        if r is not None:
+                            rating = int(round(r))
+                            break
                 except Exception:
                     pass
 
@@ -785,9 +821,11 @@ class MapsScraper:
             text = ""
             for sel in ["span.wiI7pd", "[class*='review-full-text']", "div.MyEned span"]:
                 try:
-                    text = (await card.locator(sel).first.inner_text(timeout=1500)).strip()
-                    if text:
-                        break
+                    loc = card.locator(sel).first
+                    if await loc.count() > 0:
+                        text = (await loc.inner_text(timeout=1000)).strip()
+                        if text:
+                            break
                 except Exception:
                     pass
 
@@ -795,9 +833,11 @@ class MapsScraper:
             date_raw = ""
             for sel in ["span.rsqaWe", "span[class*='dehysf']"]:
                 try:
-                    date_raw = (await card.locator(sel).first.inner_text(timeout=1500)).strip()
-                    if date_raw:
-                        break
+                    loc = card.locator(sel).first
+                    if await loc.count() > 0:
+                        date_raw = (await loc.inner_text(timeout=1000)).strip()
+                        if date_raw:
+                            break
                 except Exception:
                     pass
 
@@ -806,8 +846,8 @@ class MapsScraper:
             # Photos
             photos_count = 0
             try:
-                photos = await card.locator("button.Tya61d, img.YQ4gaf").all()
-                photos_count = len(photos)
+                photos_loc = card.locator("button.Tya61d, img.YQ4gaf")
+                photos_count = await photos_loc.count()
             except Exception:
                 pass
 
@@ -817,18 +857,16 @@ class MapsScraper:
             for sel in ["div.CDe7pd", "[class*='owner-reply']"]:
                 try:
                     loc = card.locator(sel).first
-                    await loc.wait_for(state="attached", timeout=1000)
-                    owner_reply = (await loc.inner_text(timeout=1500)).strip()
-                    # Try to separate reply date
-                    date_loc = loc.locator("span.rsqaWe").first
-                    try:
-                        owner_reply_date = (await date_loc.inner_text(timeout=800)).strip()
-                        date_iso_reply   = _relative_to_iso(owner_reply_date)
-                        owner_reply_date = date_iso_reply or owner_reply_date
-                        owner_reply      = owner_reply.replace(owner_reply_date, "").strip()
-                    except Exception:
-                        pass
-                    break
+                    if await loc.count() > 0:
+                        owner_reply = (await loc.inner_text(timeout=1000)).strip()
+                        # Try to separate reply date
+                        date_loc = loc.locator("span.rsqaWe").first
+                        if await date_loc.count() > 0:
+                            owner_reply_date = (await date_loc.inner_text(timeout=800)).strip()
+                            date_iso_reply   = _relative_to_iso(owner_reply_date)
+                            owner_reply_date = date_iso_reply or owner_reply_date
+                            owner_reply      = owner_reply.replace(owner_reply_date, "").strip()
+                        break
                 except Exception:
                     pass
 
@@ -863,13 +901,15 @@ class MapsScraper:
 
         if not await self.open_reviews_tab():
             await self._page.screenshot(path="headless-debug.png", full_page=True)
-            # print(self._page.url)
             # Return partial result (metadata only)
             return {**meta, "reviews": []}
 
         await self.sort_reviews()
-        # await self.scroll_all()
-        await self.scroll_all(meta["total_reviews"])
+        
+        # Limit scrolling to max_reviews
+        limit = min(meta["total_reviews"], self.max_reviews) if meta["total_reviews"] > 0 else self.max_reviews
+        await self.scroll_all(limit)
+        
         reviews = await self.extract_reviews()
 
         return {
@@ -900,6 +940,7 @@ def main() -> None:
                                                                "browser-profile"))
     parser.add_argument("--output",      default="json", choices=["json"])
     parser.add_argument("--headless",    action="store_true")
+    parser.add_argument("--max-reviews", type=int, default=50, help="Maximum reviews to load")
     args = parser.parse_args()
 
     async def _run():
@@ -908,12 +949,13 @@ def main() -> None:
             sort_by=args.sort,
             profile_dir=args.profile_dir,
             headless=args.headless,
+            max_reviews=args.max_reviews,
         ) as s:
             return await s.run()
 
     try:
         result = asyncio.run(_run())
-        # Only JSON goes to stdout — Laravel reads this
+        # Only JSON goes to stdout
         sys.stdout.write(json.dumps(result, ensure_ascii=False, default=str))
         sys.stdout.flush()
     except Exception as exc:
