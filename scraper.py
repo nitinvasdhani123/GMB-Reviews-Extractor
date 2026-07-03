@@ -180,37 +180,69 @@ class MapsScraper:
         #     ],
         #     ignore_default_args=["--enable-automation"],
         # )
-        self._ctx = await self._pw.chromium.launch_persistent_context(
-            user_data_dir=self.profile_dir,
+        # self._ctx = await self._pw.chromium.launch_persistent_context(
+        #     user_data_dir=self.profile_dir,
+        #     headless=self.headless,
+        #     slow_mo=60,
+        #     viewport={"width": 1380, "height": 900},
+
+        #     locale="en-US",
+
+        #     extra_http_headers={
+        #         "Accept-Language": "en-US,en;q=0.9"
+        #     },
+
+        #     timezone_id="UTC",
+
+        #     args=[
+        #         "--lang=en-US",
+        #         "--disable-blink-features=AutomationControlled",
+        #         "--no-sandbox",
+        #         "--disable-infobars",
+        #     ],
+
+        #     ignore_default_args=["--enable-automation"],
+        # )
+        # await self._ctx.add_init_script(
+        #     "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+        # )
+        # self._page = (
+        #     self._ctx.pages[0] if self._ctx.pages
+        #     else await self._ctx.new_page()
+        # )
+        # self._page.set_default_timeout(15_000)
+        # return self
+        
+        browser = await self._pw.chromium.launch(
             headless=self.headless,
             slow_mo=60,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--lang=en-US",
+            ],
+        )
+
+        self._ctx = await browser.new_context(
             viewport={"width": 1380, "height": 900},
-
             locale="en-US",
-
+            timezone_id="UTC",
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9"
             },
-
-            timezone_id="UTC",
-
-            args=[
-                "--lang=en-US",
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-infobars",
-            ],
-
-            ignore_default_args=["--enable-automation"],
         )
+
         await self._ctx.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
         )
-        self._page = (
-            self._ctx.pages[0] if self._ctx.pages
-            else await self._ctx.new_page()
-        )
-        self._page.set_default_timeout(15_000)
+
+        self._page = await self._ctx.new_page()
+
+        self._page.set_default_timeout(15000)
+
         return self
 
     async def __aexit__(self, *_):
