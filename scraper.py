@@ -546,20 +546,72 @@ class MapsScraper:
             meta["overall_rating"] = _parse_rating(rating_text)
 
         # Review count
-        # rev_text = await self._attr(SEL_REVIEW_COUNT, "aria-label") or await self._text(SEL_REVIEW_COUNT)
-        # if rev_text:
-        #     meta["total_reviews"] = _parse_count(rev_text)
-        # Review count
+        meta["total_reviews"] = 0
+        matches = []
+
         try:
-            f7_text = await self._page.locator("div.F7nice").first.inner_text()
-            log.info("F7nice text = %r", f7_text)
-
-            nums = re.findall(r"\((\d+)\)", f7_text)
-            if nums:
-                meta["total_reviews"] = int(nums[0])
-
+            candidates = await self._page.locator("[aria-label*='review'], [aria-label*='Review']").all()
+            for el in candidates:
+                try:
+                    aria_label = await el.get_attribute("aria-label")
+                    if not aria_label:
+                        continue
+                    
+                    label_clean = re.sub(r"\s+", " ", aria_label.strip().lower())
+                    if (label_clean.endswith("reviews") or label_clean.endswith("review")) and "write" not in label_clean and "rate" not in label_clean:
+                        match = re.search(r"([\d,]+)\s+reviews?$", label_clean)
+                        if match:
+                            parsed_val = int(match.group(1).replace(",", ""))
+                            text = (await el.inner_text() or "").strip()
+                            matches.append({
+                                "element": el,
+                                "aria_label": aria_label,
+                                "text": text,
+                                "parsed_val": parsed_val
+                            })
+                except Exception as e:
+                    log.debug("Error checking candidate element: %s", e)
         except Exception as e:
-            log.warning("Review count parse failed: %s", e)
+            log.warning("Failed to query review candidates: %s", e)
+
+        if len(matches) > 1:
+            log.info("Multiple matching review count elements found (%d total):", len(matches))
+            for idx, m in enumerate(matches):
+                log.info("  [%d] text=%r, aria-label=%r, parsed=%d", idx, m["text"], m["aria_label"], m["parsed_val"])
+
+        if matches:
+            selected = matches[0]
+            meta["total_reviews"] = selected["parsed_val"]
+            log.info(
+                "\nFound review element:\nselector=%r\ntext=%r\naria-label=%r\nparsed=%d\n",
+                "[aria-label*='review'], [aria-label*='Review']",
+                selected["text"],
+                selected["aria_label"],
+                selected["parsed_val"]
+            )
+        else:
+            log.warning("No review count elements found matching the criteria.")
+            rating_sec_found = False
+            for selector in ["div.F7nice", "span.ceNzKf", "span[aria-hidden='true']"]:
+                try:
+                    loc = self._page.locator(selector).first
+                    if await loc.count() > 0:
+                        parent = loc.locator("xpath=..")
+                        html = await parent.evaluate("el => el.outerHTML")
+                        log.info("Surrounding HTML of rating section (%s):\n%s", selector, html)
+                        rating_sec_found = True
+                        break
+                except Exception:
+                    pass
+            if not rating_sec_found:
+                try:
+                    title_loc = self._page.locator("h1.DUwDvf").first
+                    if await title_loc.count() > 0:
+                        parent = title_loc.locator("xpath=..")
+                        html = await parent.evaluate("el => el.outerHTML")
+                        log.info("Surrounding HTML of business name header:\n%s", html)
+                except Exception:
+                    pass
 
         # Place ID from URL
         m = re.search(r"place/([^/]+)", self._page.url)

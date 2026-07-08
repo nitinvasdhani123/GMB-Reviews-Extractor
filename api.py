@@ -58,22 +58,16 @@ async def scrape(data: ScrapeRequest):
 
     try:
         log.info(f"Launching scraper process: {' '.join(cmd)}")
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        def run_scraper_sync():
+            return subprocess.run(cmd, capture_output=True, timeout=120)
 
         try:
-            # Set a timeout of 120 seconds to prevent Railway gateway timeout
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
-        except asyncio.TimeoutError:
-            log.error("Scraper process timed out (exceeded 120s). Terminating process.")
-            try:
-                process.kill()
-                await process.wait()
-            except Exception as kill_err:
-                log.error(f"Failed to kill scraper process: {kill_err}")
+            completed_process = await asyncio.to_thread(run_scraper_sync)
+            stdout = completed_process.stdout
+            stderr = completed_process.stderr
+            returncode = completed_process.returncode
+        except subprocess.TimeoutExpired:
+            log.error("Scraper process timed out (exceeded 120s).")
             raise HTTPException(
                 status_code=408,
                 detail="Scraper execution timed out (limit 120 seconds)"
@@ -85,8 +79,8 @@ async def scrape(data: ScrapeRequest):
         if stderr_str:
             log.info(f"Scraper stderr output:\n{stderr_str}")
 
-        if process.returncode != 0:
-            log.error(f"Scraper exited with non-zero return code {process.returncode}. Stderr:\n{stderr_str}")
+        if returncode != 0:
+            log.error(f"Scraper exited with non-zero return code {returncode}. Stderr:\n{stderr_str}")
             raise HTTPException(
                 status_code=500,
                 detail=f"Scraper failed: {stderr_str}"
